@@ -1637,3 +1637,107 @@ Second paragraph
 ;;; - There are actually no org-mode tests for this.
 ;;; - Set ‘org-id-locations’ (a hash table). This maps each ID to the file in
 ;;;   which the ID is found, so a temp file (not just a temp buffer) is needed.
+
+;;; Durable sync token and Keychain token store
+
+(ert-deftest org-gcal-test--sync-token-is-deferred-until-commit ()
+  "A fetch stores the next sync token without committing it immediately."
+  (let* ((calendar-id "deferred@example.com")
+         (org-gcal--sync-tokens nil)
+         (sync-token-cons (list nil))
+         (response (make-request-response
+                    :status-code 200
+                    :data (list :items []
+                                :nextSyncToken "next-token"))))
+    (org-gcal--sync-handle-response
+     response (cons calendar-id "calendar.org") (list 'dummy) nil
+     (lambda () nil) sync-token-cons)
+    (should-not (org-gcal--sync-tokens-get calendar-id))
+    (should (equal "next-token" (cadr (car sync-token-cons))))
+    (org-gcal--commit-sync-token calendar-id sync-token-cons)
+    (should (equal "next-token" (cadr (org-gcal--sync-tokens-get calendar-id))))
+    (should-not (car sync-token-cons))))
+
+(ert-deftest org-gcal-test--sync-token-commits-without-deferred-cons ()
+  "A caller without a deferred cons keeps the immediate token behavior."
+  (let* ((calendar-id "immediate@example.com")
+         (org-gcal--sync-tokens nil)
+         (response (make-request-response
+                    :status-code 200
+                    :data (list :items []
+                                :nextSyncToken "next-token"))))
+    (org-gcal--sync-handle-response
+     response (cons calendar-id "calendar.org") (list 'dummy) nil
+     (lambda () nil))
+    (should (equal "next-token" (cadr (org-gcal--sync-tokens-get calendar-id))))))
+
+(ert-deftest org-gcal-test--save-calendar-file-persists-modified-buffer ()
+  "Fetched changes are written to disk, not left only in a buffer."
+  (let ((file (make-temp-file "org-gcal-save" nil ".org")))
+    (unwind-protect
+        (progn
+          (with-current-buffer (find-file-noselect file)
+            (insert "* First\n\n* Second\n")
+            (set-buffer-modified-p t)
+            ;; org-gcal handlers can leave the buffer narrowed.
+            (narrow-to-region (point-min) (line-end-position)))
+          (org-gcal--save-calendar-file file)
+          (with-temp-buffer
+            (insert-file-contents file)
+            (should (string-match-p "\\* First" (buffer-string)))
+            (should (string-match-p "\\* Second" (buffer-string)))))
+      (when-let ((buffer (get-file-buffer file)))
+        (kill-buffer buffer))
+      (delete-file file))))
+
+(ert-deftest org-gcal-test--keychain-json-roundtrip ()
+  "The Keychain JSON value preserves the token plist."
+  (let ((plist '(:access-token "access" :refresh-token "refresh"
+                  :expiration 1799413201)))
+    (should (equal plist
+                   (org-gcal--keychain-plist
+                    (org-gcal--keychain-json plist))))))
+
+(ert-deftest org-gcal-test--keychain-read-uses-keychain ()
+  "With the Keychain store, read uses the Keychain instead of plstore."
+  (let ((org-gcal-token-store 'keychain)
+        (plist '(:access-token "access" :refresh-token "refresh"
+                  :expiration 1799413201)))
+    (cl-letf (((symbol-function 'org-gcal--keychain-read)
+               (lambda (&rest _) plist))
+              ((symbol-function 'org-gcal--keychain-write)
+               (lambda (&rest _) (error "unexpected migration"))))
+      (should (equal plist
+                     (org-gcal--keychain-plstore-read
+                      (lambda (&rest _) (error "plstore read unexpectedly"))
+                      "user" 'org-gcal))))))
+
+(ert-deftest org-gcal-test--keychain-write-uses-keychain ()
+  "With the Keychain store, write uses the Keychain instead of plstore."
+  (let ((org-gcal-token-store 'keychain)
+        (plist '(:access-token "access" :refresh-token "refresh"
+                  :expiration 1799413201))
+        (written nil))
+    (cl-letf (((symbol-function 'org-gcal--keychain-write)
+               (lambda (_username _provider value)
+                 (setq written value)
+                 value)))
+      (should (equal plist
+                     (org-gcal--keychain-plstore-write
+                      (lambda (&rest _) (error "plstore write unexpectedly"))
+                      "user" 'org-gcal plist)))
+      (should (equal plist written)))))
+
+(ert-deftest org-gcal-test--keychain-store-ignores-other-providers ()
+  "The Keychain advice leaves other oauth2-auto providers alone."
+  (let ((org-gcal-token-store 'keychain)
+        (original-called nil))
+    (cl-letf (((symbol-function 'org-gcal--keychain-read)
+               (lambda (&rest _) (error "keychain read unexpectedly"))))
+      (should (equal 'other
+                     (org-gcal--keychain-plstore-read
+                      (lambda (&rest _)
+                        (setq original-called t)
+                        'other)
+                      "user" 'other)))
+      (should original-called))))

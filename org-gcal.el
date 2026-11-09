@@ -90,6 +90,33 @@
   :group 'org-gcal
   :type 'string)
 
+(defcustom org-gcal-token-store 'plstore
+  "Where Org-GCal stores OAuth2 tokens.
+The default keeps oauth2-auto's GPG-encrypted plstore.  The `keychain'
+value stores the token plist in the macOS login Keychain through the
+`security' command, so syncing does not open a pinentry prompt."
+  :group 'org-gcal
+  :type '(choice (const :tag "oauth2-auto plstore" plstore)
+                 (const :tag "macOS Keychain" keychain)))
+
+(defcustom org-gcal-keychain-service "org-gcal-oauth2"
+  "Keychain service name used when `org-gcal-token-store' is `keychain'."
+  :group 'org-gcal
+  :type 'string)
+
+(defcustom org-gcal-keychain-account-format "%s:%s"
+  "Format for the Keychain account name.
+The first argument is the OAuth username and the second is the provider."
+  :group 'org-gcal
+  :type 'string)
+
+(defcustom org-gcal-keychain-migrate-from-plstore t
+  "Whether to copy an existing plstore token into the Keychain on first read.
+Migration reads the old token once.  That read can still open the GPG
+pinentry prompt; later reads use only the Keychain."
+  :group 'org-gcal
+  :type 'boolean)
+
 (defvaralias 'org-gcal-file-alist 'org-gcal-fetch-file-alist)
 
 (defcustom org-gcal-fetch-file-alist nil
@@ -447,15 +474,33 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
                               calendar-id-file parent-event-id skip-export silent nil
                               up-time down-time))))))))))
 
+(defun org-gcal--save-calendar-file (calendar-file)
+  "Save CALENDAR-FILE when its buffer contains unsaved event changes."
+  (with-current-buffer (find-file-noselect calendar-file)
+    (when (buffer-modified-p)
+      (save-restriction
+        (widen)
+        (let ((inhibit-message t))
+          (save-buffer))))))
+
+(defun org-gcal--commit-sync-token (calendar-id sync-token-cons)
+  "Commit the pending sync token for CALENDAR-ID from SYNC-TOKEN-CONS."
+  (when-let* ((token-value (car sync-token-cons)))
+    (setf (org-gcal--sync-tokens-get calendar-id) token-value)
+    (setcar sync-token-cons nil)))
+
 (defun org-gcal--sync-calendar-events
     (calendar-id-file skip-export silent page-token up-time down-time
-                      parent-events)
+                      parent-events &optional sync-token-cons)
   "Sync events for CALENDAR-ID-FILE
 
-CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
+CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see.
+SYNC-TOKEN-CONS carries the next sync token across pages until the fetched
+changes are saved."
   (let* ((calendar-id (car calendar-id-file))
          (calendar-file (cdr calendar-id-file))
-         (page-token-cons '(dummy)))
+         (page-token-cons '(dummy))
+         (sync-token-cons (or sync-token-cons (list nil))))
     (deferred:$
      (org-gcal--sync-request-events calendar-id page-token up-time down-time)
      (deferred:nextc it
@@ -464,9 +509,11 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
                               (lambda ()
                                 (org-gcal--sync-calendar-events
                                  calendar-id-file skip-export silent page-token
-                                 up-time down-time parent-events))))
+                                 up-time down-time parent-events
+                                 sync-token-cons))))
                          (org-gcal--sync-handle-response
-                          response calendar-id-file page-token-cons down-time retry-fn))))
+                          response calendar-id-file page-token-cons down-time retry-fn
+                          sync-token-cons))))
      (deferred:nextc it
                      (lambda (events)
                        (org-gcal--sync-handle-events calendar-id calendar-file
@@ -475,6 +522,11 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
      (deferred:nextc it
                      (lambda (entries)
                        (org-gcal--sync-update-entries calendar-id entries skip-export)))
+     ;; Persist the fetched changes before the new sync token is committed.
+     (deferred:nextc it
+                     (lambda (_)
+                       (org-gcal--save-calendar-file calendar-file)
+                       (deferred:succeed nil)))
      ;; Retrieve the next page of results if needed.
      (deferred:nextc it
                      (lambda (_)
@@ -482,18 +534,24 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
                          (if pt
                              (org-gcal--sync-calendar-events
                               calendar-id-file skip-export silent pt
-                              up-time down-time parent-events)
-                           (deferred:succeed nil))))))))
+                              up-time down-time parent-events sync-token-cons)
+                           (progn
+                             (org-gcal--commit-sync-token calendar-id
+                                                          sync-token-cons)
+                             (deferred:succeed nil)))))))))
 
 (defun org-gcal--sync-instances
     (calendar-id-file parent-event-id skip-export silent page-token
-                      up-time down-time)
+                      up-time down-time &optional sync-token-cons)
   "Sync instances of instances of recurring event PARENT-EVENT-ID.
 
-CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
+CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see.
+SYNC-TOKEN-CONS carries the next sync token across pages until the fetched
+changes are saved."
   (let* ((calendar-id (car calendar-id-file))
          (calendar-file (cdr calendar-id-file))
-         (page-token-cons '(dummy)))
+         (page-token-cons '(dummy))
+         (sync-token-cons (or sync-token-cons (list nil))))
     (deferred:$
      (org-gcal--sync-request-instances calendar-id parent-event-id
                                        up-time down-time page-token)
@@ -503,9 +561,10 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
                               (lambda ()
                                 (org-gcal--sync-instances
                                  calendar-id-file parent-event-id skip-export silent
-                                 page-token up-time down-time))))
+                                 page-token up-time down-time sync-token-cons))))
                          (org-gcal--sync-handle-response
-                          response calendar-id-file page-token-cons down-time retry-fn))))
+                          response calendar-id-file page-token-cons down-time retry-fn
+                          sync-token-cons))))
      (deferred:nextc it
                      (lambda (events)
                        (org-gcal--sync-handle-events calendar-id calendar-file
@@ -513,6 +572,10 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
      (deferred:nextc it
                      (lambda (entries)
                        (org-gcal--sync-update-entries calendar-id entries skip-export)))
+     (deferred:nextc it
+                     (lambda (_)
+                       (org-gcal--save-calendar-file calendar-file)
+                       (deferred:succeed nil)))
      ;; Retrieve the next page of results if needed.
      (deferred:nextc it
                      (lambda (_)
@@ -520,8 +583,11 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
                          (if pt
                              (org-gcal--sync-instances
                               calendar-id-file parent-event-id skip-export silent
-                              pt up-time down-time)
-                           (deferred:succeed nil))))))))
+                              pt up-time down-time sync-token-cons)
+                           (progn
+                             (org-gcal--commit-sync-token calendar-id
+                                                          sync-token-cons)
+                             (deferred:succeed nil)))))))))
 
 (defun org-gcal--sync-event
     (calendar-id-file event-id skip-export)
@@ -541,7 +607,11 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
                                                      events nil nil nil nil)))
      (deferred:nextc it
                      (lambda (entries)
-                       (org-gcal--sync-update-entries calendar-id entries skip-export))))))
+                       (org-gcal--sync-update-entries calendar-id entries skip-export)))
+     (deferred:nextc it
+                     (lambda (_)
+                       (org-gcal--save-calendar-file calendar-file)
+                       (deferred:succeed nil))))))
 
 (defun org-gcal--sync-request-events
     (calendar-id page-token up-time down-time)
@@ -555,7 +625,8 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
    :params
    (append
     `(("access_token" . ,(org-gcal--get-access-token calendar-id))
-      ("singleEvents" . "True"))
+      ("singleEvents" . "True")
+      ("showDeleted" . "true"))
     (when org-gcal-local-timezone `(("timeZone" . ,org-gcal-local-timezone)))
     (seq-let [expires sync-token]
         ;; Ensure ‘org-gcal--sync-tokens-get’ return value is actually a list
@@ -588,17 +659,21 @@ CALENDAR-ID-FILE is a cons in ‘org-gcal-fetch-file-alist’, for which see."
    :params
    (append
     `(("access_token" . ,(org-gcal--get-access-token calendar-id))
+      ("showDeleted" . "true")
       ("timeMin" . ,(org-gcal--format-time2iso up-time))
       ("timeMax" . ,(org-gcal--format-time2iso down-time)))
     (when page-token `(("pageToken" . ,page-token))))
    :parser 'org-gcal--json-read))
 
 (defun org-gcal--sync-handle-response
-    (response calendar-id-file page-token-cons down-time retry-fn)
+    (response calendar-id-file page-token-cons down-time retry-fn
+              &optional sync-token-cons)
   "Handle RESPONSE in ‘org-gcal--sync-calendar' for CALENDAR-ID-FILE.
 
 Update PAGE-TOKEN from the response, and return a ‘deferred’ list of event
-objects for further processing."
+objects for further processing.  When SYNC-TOKEN-CONS is non-nil, store the
+next sync token there instead of committing it immediately.  The caller
+commits it only after the fetched changes are saved."
   (let
       ((data (request-response-data response))
        (status-code (request-response-status-code response))
@@ -652,17 +727,20 @@ objects for further processing."
       (nconc page-token-cons (list (plist-get data :nextPageToken)))
       (let ((next-sync-token (plist-get data :nextSyncToken)))
         (when next-sync-token
-          (setf (org-gcal--sync-tokens-get calendar-id)
-                (list
-                 ;; The first element is the expiration time of
-                 ;; the sync token. Note that, if the expiration
-                 ;; time already exists, we don't update it. We
-                 ;; want to expire the token according to the
-                 ;; time of the previous full sync.
-                 (or
-                  (car (org-gcal--sync-tokens-get calendar-id))
-                  down-time)
-                 next-sync-token))))
+          (let ((token-value
+                 (list
+                  ;; The first element is the expiration time of
+                  ;; the sync token. Note that, if the expiration
+                  ;; time already exists, we don't update it. We
+                  ;; want to expire the token according to the
+                  ;; time of the previous full sync.
+                  (or
+                   (car (org-gcal--sync-tokens-get calendar-id))
+                   down-time)
+                  next-sync-token)))
+            (if sync-token-cons
+                (setcar sync-token-cons token-value)
+              (setf (org-gcal--sync-tokens-get calendar-id) token-value)))))
       (org-gcal--filter (plist-get data :items))))))
 
 (defun org-gcal--sync-handle-events
@@ -1407,6 +1485,101 @@ delete calendar info from events on calendars you no longer have access to."
                         calendar-id event-id delete-error)
                (deferred:succeed nil))))
         (deferred:succeed nil)))))
+
+(defun org-gcal--keychain-account (username provider)
+  "Return the Keychain account name for USERNAME and PROVIDER."
+  (format org-gcal-keychain-account-format username provider))
+
+(defun org-gcal--keychain-json (plist)
+  "Encode the token PLIST as the JSON value stored in the Keychain."
+  (json-serialize
+   (list :access-token (plist-get plist :access-token)
+         :refresh-token (plist-get plist :refresh-token)
+         :expiration (plist-get plist :expiration))))
+
+(defun org-gcal--keychain-plist (json)
+  "Decode Keychain JSON into an oauth2-auto token plist."
+  (json-parse-string json :object-type 'plist :null-object nil))
+
+(defun org-gcal--keychain-read (username provider)
+  "Read the token for USERNAME and PROVIDER from the macOS Keychain.
+Return nil when the item does not exist."
+  (unless (executable-find "security")
+    (error "Org-GCal Keychain token store requires the macOS security command"))
+  (let* ((service org-gcal-keychain-service)
+         (account (org-gcal--keychain-account username provider))
+         (buffer (generate-new-buffer " *org-gcal-keychain*")))
+    (unwind-protect
+        (let ((status (call-process "security" nil buffer nil
+                                    "find-generic-password"
+                                    "-s" service "-a" account "-w")))
+          (when (eq status 0)
+            (with-current-buffer buffer
+              (org-gcal--keychain-plist
+               (string-trim (buffer-string))))))
+      (kill-buffer buffer))))
+
+(defun org-gcal--keychain-write (username provider plist)
+  "Save token PLIST for USERNAME and PROVIDER in the macOS Keychain."
+  (unless (executable-find "security")
+    (error "Org-GCal Keychain token store requires the macOS security command"))
+  (let* ((service org-gcal-keychain-service)
+         (account (org-gcal--keychain-account username provider))
+         (buffer (generate-new-buffer " *org-gcal-keychain*")))
+    (unwind-protect
+        (let ((status (call-process "security" nil buffer nil
+                                    "add-generic-password" "-U"
+                                    "-s" service "-a" account
+                                    "-w" (org-gcal--keychain-json plist))))
+          (unless (eq status 0)
+            (error "Could not save Org-GCal OAuth token to the macOS Keychain (security exit %s)"
+                   status)))
+      (kill-buffer buffer))
+    plist))
+
+(defun org-gcal--keychain-plstore-read (original username provider)
+  "Read ORIGINAL plstore data unless the Keychain is the configured store.
+Migrate an existing plstore token once when no Keychain item exists."
+  (if (not (and (eq provider 'org-gcal)
+                (eq org-gcal-token-store 'keychain)))
+      (funcall original username provider)
+    (or (org-gcal--keychain-read username provider)
+        (when org-gcal-keychain-migrate-from-plstore
+          (when-let* ((plist (funcall original username provider)))
+            (org-gcal--keychain-write username provider plist)
+            (message "Org-GCal: migrated OAuth token to the macOS Keychain")
+            plist)))))
+
+(defun org-gcal--keychain-plstore-write (original username provider plist)
+  "Write token PLIST to the Keychain, or call ORIGINAL for other providers."
+  (if (not (and (eq provider 'org-gcal)
+                (eq org-gcal-token-store 'keychain)))
+      (funcall original username provider plist)
+    (org-gcal--keychain-write username provider plist)))
+
+(defun org-gcal--install-token-store-advice ()
+  "Route OAuth tokens through the configured store."
+  (unless (advice-member-p #'org-gcal--keychain-plstore-read
+                           'oauth2-auto--plstore-read)
+    (advice-add 'oauth2-auto--plstore-read :around
+                #'org-gcal--keychain-plstore-read))
+  (unless (advice-member-p #'org-gcal--keychain-plstore-write
+                           'oauth2-auto--plstore-write)
+    (advice-add 'oauth2-auto--plstore-write :around
+                #'org-gcal--keychain-plstore-write)))
+
+(defun org-gcal-migrate-token-to-keychain ()
+  "Copy the current OAuth token for each configured calendar into the Keychain.
+This command reads the existing plstore once, so it can still prompt for
+the GPG passphrase.  Set `org-gcal-token-store' to `keychain' first."
+  (interactive)
+  (unless (eq org-gcal-token-store 'keychain)
+    (user-error "Set org-gcal-token-store to `keychain' first"))
+  (dolist (calendar-id-file org-gcal-fetch-file-alist)
+    (org-gcal--get-access-token (car calendar-id-file)))
+  (message "Org-GCal: OAuth tokens copied to the macOS Keychain"))
+
+(org-gcal--install-token-store-advice)
 
 (defun org-gcal--get-access-token (calendar-id)
   "Return the access token for CALENDAR-ID."

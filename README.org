@@ -170,6 +170,26 @@ Set `epg-pinentry-mode` to `'loopback` to avoid hanging errors during sync (#267
 (setq epg-pinentry-mode 'loopback)
 #+end_src
 
+*** macOS Keychain token storage
+
+On macOS you can keep the OAuth token in the login Keychain instead of the
+GPG-encrypted plstore.  This avoids the pinentry prompt on every sync:
+
+#+begin_src elisp
+(setq org-gcal-token-store 'keychain)
+#+end_src
+
+The token is stored as a generic password under the service named by
+`org-gcal-keychain-service` (default `"org-gcal-oauth2"`).  The account name is
+the OAuth username and provider.  The value is a JSON object with the access
+token, refresh token, and expiration.
+
+The first read with `org-gcal-token-store` set to `keychain` copies an existing
+plstore token into the Keychain.  That one migration read can still prompt for
+the plstore passphrase.  Set `org-gcal-keychain-migrate-from-plstore` to nil to
+disable the automatic copy.  You can run `M-x
+org-gcal-migrate-token-to-keychain` to perform the copy explicitly.
+
 ** Multiple accounts
 
    There's no support for multiple accounts.  If you want to use
