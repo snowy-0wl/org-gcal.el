@@ -862,7 +862,10 @@ have been moved from the default fetch file.  CALENDAR-ID is defined in
                      (deferred:error it
                                      (lambda (err)
                                        (message "org-gcal-sync: error: %s" err))))))
-   (deferred:succeed nil)))
+   ;; Resolve only after every queued update has run, so callers can save and
+   ;; commit the sync token when the fetched changes are actually applied.
+   (deferred:nextc it
+                   (lambda (_) (deferred:succeed nil)))))
 
 (defun org-gcal--sync-lock ()
   "Activate sync lock."

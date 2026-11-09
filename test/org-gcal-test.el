@@ -1671,6 +1671,49 @@ Second paragraph
      (lambda () nil))
     (should (equal "next-token" (cadr (org-gcal--sync-tokens-get calendar-id))))))
 
+(ert-deftest org-gcal-test--sync-update-entries-waits-for-updates ()
+  "Do not resolve until the queued entry updates have finished.
+Callers save the buffer and commit the sync token after this
+function resolves, so an early result would make those changes
+invisible or lose them."
+  (let ((loop-deferred (deferred:next))
+        (finished nil))
+    (cl-letf (((symbol-function 'deferred:loop)
+               (lambda (_entries _body)
+                 ;; Resolve the loop asynchronously, like deferred:loop does
+                 ;; when its callbacks are queued rather than run immediately.
+                 (run-at-time 0 nil
+                              (lambda ()
+                                (setq finished t)
+                                (deferred:callback loop-deferred nil)))
+                 loop-deferred)))
+      (deferred:sync! (org-gcal--sync-update-entries
+                       org-gcal-test-calendar-id nil t))
+      (should finished))))
+
+(ert-deftest org-gcal-test--failed-save-does-not-commit-sync-token ()
+  "Keep the previous sync token when saving fetched changes fails."
+  (let* ((calendar-id "save-fail@example.com")
+         (org-gcal--sync-tokens nil)
+         (response (make-request-response
+                    :status-code 200
+                    :data (list :items []
+                                :nextSyncToken "next-token"))))
+    (cl-letf (((symbol-function 'org-gcal--sync-request-events)
+               (lambda (&rest _) (deferred:succeed response)))
+              ((symbol-function 'org-gcal--sync-handle-events)
+               (lambda (&rest _) nil))
+              ((symbol-function 'org-gcal--sync-update-entries)
+               (lambda (&rest _) (deferred:succeed nil)))
+              ((symbol-function 'org-gcal--save-calendar-file)
+               (lambda (&rest _) (error "save failed"))))
+      (should-error
+       (deferred:sync!
+        (org-gcal--sync-calendar-events
+         (cons calendar-id "/tmp/org-gcal-unsaved.org") t t nil
+         (org-gcal--up-time) (org-gcal--down-time) nil)))
+      (should-not (org-gcal--sync-tokens-get calendar-id)))))
+
 (ert-deftest org-gcal-test--save-calendar-file-persists-modified-buffer ()
   "Fetched changes are written to disk, not left only in a buffer."
   (let ((file (make-temp-file "org-gcal-save" nil ".org")))
