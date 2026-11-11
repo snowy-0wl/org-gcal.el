@@ -150,3 +150,75 @@
         (setq m (org-generic-id-find "SN" "sn2"))
         (should (equal m
                        `(,org-file . 78)))))))
+
+(ert-deftest org-generic-id--canonical-file-identity ()
+  "Verify symlink aliases of one file collapse to one ID location.
+The scan list, the stored ID locations, and `org-generic-id-files'
+must all use the canonical name while genuinely distinct files stay
+distinct."
+  (let* ((dir (make-temp-file "org-generic-id-alias." t))
+         (real-dir (expand-file-name "real" dir))
+         (alias-dir (expand-file-name "alias" dir))
+         (org-file (expand-file-name "calendar.org" real-dir))
+         (alias-file (expand-file-name "calendar.org" alias-dir))
+         (archive-file (expand-file-name "calendar.org_archive" real-dir))
+         (canonical-file (org-generic-id--canonical-file org-file))
+         (canonical-archive (org-generic-id--canonical-file archive-file))
+         (org-generic-id-locations-file (expand-file-name "locations.el" dir))
+         (org-generic-id-locations (org-generic-id--make-hash-table))
+         (org-generic-id--last-update-id-time nil)
+         (org-agenda-files nil)
+         (org-generic-id-extra-files nil))
+    (unwind-protect
+        (progn
+          (make-directory real-dir)
+          (make-symbolic-link real-dir alias-dir)
+          (with-temp-file org-file
+            (insert "\
+* Event one
+:PROPERTIES:
+:entry-id: event-1/calendar@example.com
+:END:
+* Event two
+:PROPERTIES:
+:entry-id: event-2/calendar@example.com
+:END:
+"))
+          (with-temp-file archive-file
+            (insert "\
+* Archived event
+:PROPERTIES:
+:entry-id: old-1/calendar@example.com
+:END:
+"))
+          (let (duplicates)
+            (cl-letf (((symbol-function 'message)
+                       (lambda (format-string &rest args)
+                         (let ((text (apply #'format format-string args)))
+                           (when (string-match-p "Duplicate :entry-id:" text)
+                             (push text duplicates))))))
+              (org-generic-id-update-id-locations
+               "entry-id" (list alias-file org-file archive-file)))
+            (should-not duplicates))
+          (should (equal (sort (org-generic-id-files) #'string<)
+                         (sort (list canonical-file canonical-archive)
+                               #'string<)))
+          (let ((locations (gethash "entry-id" org-generic-id-locations)))
+            (should (= 3 (hash-table-count locations)))
+            (should (equal (gethash "event-1/calendar@example.com" locations)
+                           canonical-file))
+            (should (equal (gethash "event-2/calendar@example.com" locations)
+                           canonical-file))
+            (should (equal (gethash "old-1/calendar@example.com" locations)
+                           canonical-archive)))
+          ;; `org-gcal--put-id' reaches the location index through this
+          ;; function, so an alias must be canonicalized here as well.
+          (org-generic-id-add-location
+           "entry-id" "event-3/calendar@example.com" alias-file)
+          (should (equal (gethash "event-3/calendar@example.com"
+                                  (gethash "entry-id" org-generic-id-locations))
+                         canonical-file))
+          (should (equal (sort (org-generic-id-files) #'string<)
+                         (sort (list canonical-file canonical-archive)
+                               #'string<))))
+      (delete-directory dir t))))

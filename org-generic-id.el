@@ -89,15 +89,24 @@ values are as follows:
 The table has weak values so that it does not cause buffers to be retained when
 they would otherwise be garbage collected (after being killed, for example).")
 
+(defun org-generic-id--canonical-file (file)
+  "Return the canonical identity of FILE.
+Resolve symlinks and expand relative names, then abbreviate the
+result so it matches the paths stored by `org-generic-id-add-location'.
+Files with no symlink relationship remain distinct."
+  (abbreviate-file-name (file-truename (expand-file-name file))))
+
 (defun org-generic-id-files ()
-  "Return a list of all files known to have IDs."
+  "Return a list of all files known to have IDs.
+Each physical file appears once, even when its ID locations were
+recorded under different symlink spellings."
   (let ((tmp (org-generic-id--make-hash-table))
         res)
     (maphash
      (lambda (_id-name id-hash)
        (maphash
         (lambda (_id file)
-          (puthash file t tmp))
+          (puthash (org-generic-id--canonical-file file) t tmp))
         id-hash))
      org-generic-id-locations)
     (maphash
@@ -191,7 +200,7 @@ When FILES is given, scan also these files."
   (interactive "sID Property: ")
   (let* ((files
           (delete-dups
-           (mapcar #'abbreviate-file-name
+           (mapcar #'org-generic-id--canonical-file
                    (cl-remove-if-not
                     ;; Default `org-generic-id-extra-files' value contains
                     ;; `agenda-archives' symbol.
@@ -325,7 +334,7 @@ When FILES is given, scan also these files."
   ;; Only when the buffer has a file
   (unless file
     (error "bug: ‘org-generic-id-add-locations' expects a file-visiting buffer"))
-  (let ((afile (abbreviate-file-name file)))
+  (let ((afile (org-generic-id--canonical-file file)))
     (when id
       (let ((id-prop-hash (gethash id-prop org-generic-id-locations
                                    (org-generic-id--make-hash-table))))
